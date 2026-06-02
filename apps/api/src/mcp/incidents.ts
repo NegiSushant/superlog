@@ -21,23 +21,26 @@ export function registerIncidentTools(
   server: McpServer,
   session: { userId: string; activeProjectId: string; allowedOrgId?: string },
 ): void {
-  const resolve = async (explicit: string | undefined): Promise<string> => {
-    const id = explicit ?? session.activeProjectId;
-    await assertProjectAccess(session.userId, id);
-    return id;
-  };
-
-  // For org-scoped MCP tokens, reject incidents whose project lives outside the
-  // token's org. get_incident takes a bare (global) id, so this is the only
-  // thing keeping a scoped token from reaching another org's incident.
+  // For org-scoped MCP tokens, reject any project outside the token's org —
+  // even one the user is individually a member of. Mirrors the boundary every
+  // telemetry tool enforces via server.ts's resolveProject. Both an explicit
+  // project_id (search_incidents) and an incident's resolved project
+  // (get_incident, which takes a bare global id) must pass this.
   const assertTokenScope = async (projectId: string): Promise<void> => {
     if (!session.allowedOrgId) return;
     const project = await db.query.projects.findFirst({
       where: eq(schema.projects.id, projectId),
     });
     if (!project || project.orgId !== session.allowedOrgId) {
-      throw new HTTPException(403, { message: "incident is outside this MCP token's org scope" });
+      throw new HTTPException(403, { message: "project is outside this MCP token's org scope" });
     }
+  };
+
+  const resolve = async (explicit: string | undefined): Promise<string> => {
+    const id = explicit ?? session.activeProjectId;
+    await assertTokenScope(id);
+    await assertProjectAccess(session.userId, id);
+    return id;
   };
 
   server.registerTool(
