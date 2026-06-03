@@ -815,6 +815,23 @@ function histogramQuantileQuery(args: {
   `;
 }
 
+// Cumulative monotonic counters (OTel temporality=2, IsMonotonic) report a
+// running total per series. To chart them we need the *increase* per render
+// bucket. The naive approach — diff consecutive samples and drop each diff into
+// the single bucket the later sample lands in — produces a "comb" whenever the
+// render step is finer than the export interval: every bucket without a sample
+// renders as zero, so a 60s-exported counter drawn at a 30s step alternates
+// full/empty bars that read as two interleaved series.
+//
+// Instead we spread each sample's increase across the wall-clock interval it
+// actually covers (previous sample -> this sample), à la Prometheus rate(),
+// weighting by how much each render bucket overlaps that interval. A 60s
+// increase straddling two 30s buckets contributes ~half to each, so the series
+// is continuous. The spread is conservative: the weights for one interval sum
+// to its full duration, so the total increase over the range is unchanged —
+// only its distribution across buckets is smoothed. When the step is coarser
+// than the export interval the whole interval lands in one bucket and this
+// collapses back to the plain per-bucket delta.
 function cumulativeMonotonicSumQuery(args: {
   table: string;
   step: Step;
@@ -824,6 +841,11 @@ function cumulativeMonotonicSumQuery(args: {
 }): string {
   const { table, step, groupExpr, conds, sinceExpr } = args;
   const where = conds.join(" AND ");
+  // Bucket arithmetic is done in nanoseconds (TimeUnix is DateTime64) so that
+  // sub-second sample intervals aren't quantized away — truncating to whole
+  // seconds can collapse a short interval to zero duration and silently drop
+  // its increase.
+  const stepNs = stepSeconds(step) * 1_000_000_000;
   return `
     SELECT
       bucket,
@@ -831,41 +853,67 @@ function cumulativeMonotonicSumQuery(args: {
       sum(v) AS v
     FROM (
       SELECT
-        toString(toStartOfInterval(TimeUnix, INTERVAL ${step.n} ${step.unit})) AS bucket,
+        toString(toStartOfInterval(toDateTime(intDiv(sp.1, 1000000000)), INTERVAL ${step.n} ${step.unit})) AS bucket,
         group_key,
-        if(
-          previous_value IS NULL,
-          if(StartTimeUnix >= ${sinceExpr}, Value, 0),
-          if(Value >= previous_value, Value - previous_value, 0)
-        ) AS v
+        sp.2 AS v
       FROM (
         SELECT
-          TimeUnix,
-          StartTimeUnix,
-          Value,
-          ${groupExpr} AS group_key,
-          lagInFrame(toNullable(Value), 1, NULL) OVER (
-            PARTITION BY series_key
-            ORDER BY TimeUnix ASC
-            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-          ) AS previous_value
+          group_key,
+          if(
+            previous_value IS NULL,
+            -- First sample of a series: no interval to spread over. Only count
+            -- it when the series started inside the window, dropped into the
+            -- bucket the sample lands in.
+            [ tuple(intDiv(b, ${stepNs}) * ${stepNs}, if(StartTimeUnix >= ${sinceExpr}, Value, 0)) ],
+            -- Spread the increase across every step-aligned bucket the interval
+            -- (a, b] touches, weighted by overlap nanos / interval nanos.
+            arrayMap(
+              g -> tuple(g, delta * (least(b, g + ${stepNs}) - greatest(a, g)) / dt),
+              arrayMap(
+                i -> first_bucket + i * ${stepNs},
+                range(toUInt32(intDiv(intDiv(b - 1, ${stepNs}) * ${stepNs} - first_bucket, ${stepNs}) + 1))
+              )
+            )
+          ) AS spread
         FROM (
           SELECT
-            *,
-            cityHash64(
-              ServiceName,
-              MetricName,
-              MetricUnit,
-              toString(ResourceAttributes),
-              toString(Attributes),
-              toString(StartTimeUnix)
-            ) AS series_key
-          FROM ${table}
-          WHERE ${where}
-            AND AggregationTemporality = 2
-            AND IsMonotonic
+            group_key,
+            StartTimeUnix,
+            Value,
+            previous_value,
+            if(Value >= previous_value, Value - previous_value, 0) AS delta,
+            toUnixTimestamp64Nano(prev_time) AS a,
+            toUnixTimestamp64Nano(TimeUnix) AS b,
+            greatest(toUnixTimestamp64Nano(TimeUnix) - toUnixTimestamp64Nano(prev_time), 1) AS dt,
+            intDiv(toUnixTimestamp64Nano(prev_time), ${stepNs}) * ${stepNs} AS first_bucket
+          FROM (
+            SELECT
+              TimeUnix,
+              StartTimeUnix,
+              Value,
+              ${groupExpr} AS group_key,
+              lagInFrame(toNullable(Value), 1, NULL) OVER series AS previous_value,
+              lagInFrame(TimeUnix, 1, TimeUnix) OVER series AS prev_time
+            FROM ${table}
+            WHERE ${where}
+              AND AggregationTemporality = 2
+              AND IsMonotonic
+            WINDOW series AS (
+              PARTITION BY cityHash64(
+                ServiceName,
+                MetricName,
+                MetricUnit,
+                toString(ResourceAttributes),
+                toString(Attributes),
+                toString(StartTimeUnix)
+              )
+              ORDER BY TimeUnix ASC
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            )
+          )
         )
       )
+      ARRAY JOIN spread AS sp
 
       UNION ALL
 
