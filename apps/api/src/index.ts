@@ -1109,6 +1109,7 @@ async function getProjectAutomation(projectId: string): Promise<{
   linearTicketPolicy: schema.LinearTicketPolicy;
   linearTicketInstructions: schema.LinearTicketInstruction[];
   prPolicy: schema.PrPolicy;
+  prBaseBranch: string | null;
   autoMergeFixPrs: schema.AutoMergePolicy;
   autoMergeMethod: schema.AutoMergeMethod;
   issueFilterConfig: schema.IssueFilterConfig;
@@ -1126,6 +1127,7 @@ async function getProjectAutomation(projectId: string): Promise<{
     linearTicketPolicy: row?.linearTicketPolicy ?? "on_ready_to_pr",
     linearTicketInstructions: row?.linearTicketInstructions ?? [],
     prPolicy: row?.prPolicy ?? "on_ready_to_pr",
+    prBaseBranch: schema.normalizePrBaseBranch(row?.prBaseBranch),
     autoMergeFixPrs: row?.autoMergeFixPrs ?? "never",
     autoMergeMethod: row?.autoMergeMethod ?? "squash",
     issueFilterConfig: row?.issueFilterConfig ?? schema.EMPTY_ISSUE_FILTER_CONFIG,
@@ -1540,6 +1542,20 @@ const VALID_AUTO_MERGE_POLICIES: ReadonlySet<string> = new Set([
 const VALID_AUTO_MERGE_METHODS: ReadonlySet<string> = new Set(["squash", "merge", "rebase"]);
 const MAX_INSTRUCTIONS_LEN = 8000;
 
+function parsePrBaseBranch(input: unknown, current: string | null): string | null {
+  if (input === undefined) return current;
+  if (input === null) return null;
+  if (typeof input !== "string") return current;
+  const branch = schema.normalizePrBaseBranch(input);
+  if (branch && !schema.isValidPrBaseBranch(branch)) {
+    throw new HTTPException(400, {
+      message:
+        "prBaseBranch must be a valid Git branch name, or blank to use the repository default",
+    });
+  }
+  return branch;
+}
+
 app.patch("/api/projects/:projectId/automation", async (c) => {
   const projectId = c.req.param("projectId");
   await requireProjectAccess(c, projectId);
@@ -1555,6 +1571,7 @@ app.patch("/api/projects/:projectId/automation", async (c) => {
     linearTicketPolicy?: unknown;
     linearTicketInstructions?: unknown;
     prPolicy?: unknown;
+    prBaseBranch?: unknown;
     autoMergeFixPrs?: unknown;
     autoMergeMethod?: unknown;
     issueFilterConfig?: unknown;
@@ -1607,6 +1624,7 @@ app.patch("/api/projects/:projectId/automation", async (c) => {
     typeof body.prPolicy === "string" && VALID_AGENT_POLICIES.has(body.prPolicy)
       ? (body.prPolicy as schema.PrPolicy)
       : current.prPolicy;
+  const prBaseBranch = parsePrBaseBranch(body.prBaseBranch, current.prBaseBranch);
   const autoMergeFixPrs: schema.AutoMergePolicy =
     typeof body.autoMergeFixPrs === "string" && VALID_AUTO_MERGE_POLICIES.has(body.autoMergeFixPrs)
       ? (body.autoMergeFixPrs as schema.AutoMergePolicy)
@@ -1647,6 +1665,7 @@ app.patch("/api/projects/:projectId/automation", async (c) => {
     linearTicketPolicy,
     linearTicketInstructions,
     prPolicy,
+    prBaseBranch,
     autoMergeFixPrs,
     autoMergeMethod,
     issueFilterConfig,
@@ -1668,6 +1687,7 @@ app.patch("/api/projects/:projectId/automation", async (c) => {
         linearTicketPolicy,
         linearTicketInstructions,
         prPolicy,
+        prBaseBranch,
         autoMergeFixPrs,
         autoMergeMethod,
         issueFilterConfig,
