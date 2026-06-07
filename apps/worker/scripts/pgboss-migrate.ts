@@ -8,17 +8,27 @@
 // DATABASE_URL for local/worktree use. supervise/schedule are disabled so this
 // only installs/migrates and does no maintenance or cron work before exiting.
 
+// Preload .env / .env.local so local/worktree runs pick up DATABASE_URL without
+// exporting it manually. No-op in the migrate task, where PG* comes from the
+// task definition (env.ts only loads dotenv; it never validates or throws).
+import "../src/env.js";
 import { PgBoss } from "pg-boss";
 
 function dbConfig(): Record<string, unknown> {
   const connectionString = process.env.DATABASE_URL;
   if (connectionString) return { connectionString };
+  const { PGHOST, PGUSER, PGDATABASE } = process.env;
+  if (!PGHOST || !PGUSER || !PGDATABASE) {
+    throw new Error(
+      "pgboss:migrate needs a database connection: set DATABASE_URL, or PGHOST + PGUSER + PGDATABASE (libpq) env",
+    );
+  }
   return {
-    host: process.env.PGHOST,
+    host: PGHOST,
     port: process.env.PGPORT ? Number(process.env.PGPORT) : 5432,
-    user: process.env.PGUSER,
+    user: PGUSER,
     password: process.env.PGPASSWORD,
-    database: process.env.PGDATABASE,
+    database: PGDATABASE,
     ssl: process.env.PGSSLMODE === "require" ? { rejectUnauthorized: false } : undefined,
   };
 }
