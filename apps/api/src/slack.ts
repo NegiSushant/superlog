@@ -7,7 +7,7 @@ import {
   schema,
   syncLoopsContactsForOrg,
 } from "@superlog/db";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import type { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
@@ -513,11 +513,18 @@ async function findInstallationForTeam(teamId: string) {
       eq(schema.slackInstallations.teamId, teamId),
       isNull(schema.slackInstallations.revokedAt),
     ),
-    // Deterministic pick when a team owns multiple non-revoked rows (the same
-    // workspace installed into several projects). Best-effort only — for
-    // incident-scoped actions prefer installationForIncident, which uses the
-    // exact pinned installation; this team lookup is the legacy/unpinned path.
-    orderBy: desc(schema.slackInstallations.createdAt),
+    // When a team owns multiple non-revoked rows (the same workspace installed
+    // into several projects) Slack keeps only the most-recently-minted bot
+    // token live, so order by token-refresh recency — `installedAt`, which is
+    // set on every (re)auth, NOT `createdAt`, which the in-place token refresh
+    // leaves stale. Legacy rows predating `installedAt` are NULL, so fall back
+    // to `createdAt` for them via coalesce rather than letting NULLs sort last.
+    // Still best-effort: for incident-scoped actions prefer
+    // installationForIncident, which uses the exact pinned installation. This
+    // team lookup is only the legacy/unpinned fallback.
+    orderBy: desc(
+      sql`coalesce(${schema.slackInstallations.installedAt}, ${schema.slackInstallations.createdAt})`,
+    ),
   });
 }
 
@@ -741,6 +748,7 @@ async function upsertInstallation(v: {
       botAccessToken: v.botAccessToken,
       scope: v.scope,
       installedByUserId: v.installedByUserId,
+      installedAt: new Date(),
     })
     .onConflictDoUpdate({
       target: [schema.slackInstallations.projectId, schema.slackInstallations.teamId],
@@ -751,6 +759,10 @@ async function upsertInstallation(v: {
         scope: v.scope,
         installedByUserId: v.installedByUserId,
         revokedAt: null,
+        // Reinstall mints a fresh bot token and invalidates the old one, so
+        // record the refresh time — this is what the team-wide fallback orders
+        // by to find the row holding the currently-live token.
+        installedAt: new Date(),
       },
     });
 }
